@@ -38,12 +38,12 @@ class CapsNet(object):
         with tf.variable_scope('PrimaryCaps_layer'):
             primaryCaps = CapsLayer(num_outputs=32, vec_len=8, with_routing=False, layer_type='CONV')
             caps1 = primaryCaps(conv1, kernel_size=9, stride=2)
-            assert caps1.get_shape() == [cfg.batch_size, 1152, 8, 1]
 
         # DigitCaps layer, return [batch_size, 10, 16, 1]
         with tf.variable_scope('DigitCaps_layer'):
             digitCaps = CapsLayer(num_outputs=10, vec_len=16, with_routing=True, layer_type='FC')
             self.caps2 = digitCaps(caps1)
+            self.b_IJ = digitCaps.b_IJ
 
         # Decoder structure in Fig. 2
         # 1. Do masking, how:
@@ -51,14 +51,14 @@ class CapsNet(object):
             # a). calc ||v_c||, then do softmax(||v_c||)
             # [batch_size, 10, 16, 1] => [batch_size, 10, 1, 1]
             self.v_length = tf.sqrt(tf.reduce_sum(tf.square(self.caps2),
-                                                  axis=2, keep_dims=True))
+                                                  axis=2)+1e-7)
             self.softmax_v = tf.nn.softmax(self.v_length, dim=1)
-            assert self.softmax_v.get_shape() == [cfg.batch_size, 10, 1, 1]
+            assert self.softmax_v.get_shape() == [cfg.batch_size, 10]
 
             # b). pick out the index of max softmax val of the 10 caps
             # [batch_size, 10, 1, 1] => [batch_size] (index)
             argmax_idx = tf.to_int32(tf.argmax(self.softmax_v, axis=1))
-            assert argmax_idx.get_shape() == [cfg.batch_size, 1, 1]
+            assert argmax_idx.get_shape() == [cfg.batch_size, ]
 
             # c). indexing
             # It's not easy to understand the indexing process with argmax_idx
@@ -67,10 +67,10 @@ class CapsNet(object):
             argmax_idx = tf.reshape(argmax_idx, shape=(cfg.batch_size, ))
             for batch_size in range(cfg.batch_size):
                 v = self.caps2[batch_size][argmax_idx[batch_size], :]
-                masked_v.append(tf.reshape(v, shape=(1, 1, 16, 1)))
+                masked_v.append(tf.reshape(v, shape=(1, 16)))
 
             self.masked_v = tf.concat(masked_v, axis=0)
-            assert self.masked_v.get_shape() == [cfg.batch_size, 1, 16, 1]
+            assert self.masked_v.get_shape() == [cfg.batch_size, 16]
 
         # 2. Reconstructe the MNIST images with 3 FC layers
         # [batch_size, 1, 16, 1] => [batch_size, 16] => [batch_size, 512]
@@ -88,13 +88,16 @@ class CapsNet(object):
         # [batch_size, 10, 1, 1]
         # max_l = max(0, m_plus-||v_c||)^2
         max_l = tf.square(tf.maximum(0., cfg.m_plus - self.v_length))
+        self.max_l = tf.reduce_mean(max_l)
         # max_r = max(0, ||v_c||-m_minus)^2
         max_r = tf.square(tf.maximum(0., self.v_length - cfg.m_minus))
-        assert max_l.get_shape() == [cfg.batch_size, 10, 1, 1]
+        self.max_r = tf.reduce_mean(max_r)
+        self.v_length_sum = tf.reduce_sum(self.v_length)
+        assert max_l.get_shape() == [cfg.batch_size, 10]
 
         # reshape: [batch_size, 10, 1, 1] => [batch_size, 10]
-        max_l = tf.reshape(max_l, shape=(cfg.batch_size, -1))
-        max_r = tf.reshape(max_r, shape=(cfg.batch_size, -1))
+        #max_l = tf.reshape(max_l, shape=(cfg.batch_size, -1))
+        #max_r = tf.reshape(max_r, shape=(cfg.batch_size, -1))
 
         # calc T_c: [batch_size, 10]
         # T_c = Y, is my understanding correct? Try it.
@@ -102,17 +105,21 @@ class CapsNet(object):
         # [batch_size, 10], element-wise multiply
         L_c = T_c * max_l + cfg.lambda_val * (1 - T_c) * max_r
 
-        self.margin_loss = tf.reduce_mean(tf.reduce_sum(L_c, axis=1))
+        self.margin_loss = tf.reduce_sum(tf.reduce_sum(L_c, axis=1))
 
         # 2. The reconstruction loss
         orgin = tf.reshape(self.X, shape=(cfg.batch_size, -1))
         squared = tf.square(self.decoded - orgin)
-        self.reconstruction_err = tf.reduce_mean(squared)
+        self.reconstruction_err = tf.reduce_sum(squared)
 
         # 3. Total loss
         self.total_loss = self.margin_loss + 0.0005 * self.reconstruction_err
 
         # Summary
+        tf.summary.scalar('max_r', self.max_r)
+        tf.summary.scalar('max_l', self.max_l)
+        tf.summary.scalar('v_length_sum', self.v_length_sum)
+        tf.summary.scalar('b_IJ', tf.reduce_sum(tf.abs(self.b_IJ)))
         tf.summary.scalar('margin_loss', self.margin_loss)
         tf.summary.scalar('reconstruction_loss', self.reconstruction_err)
         tf.summary.scalar('total_loss', self.total_loss)
